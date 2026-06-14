@@ -102,3 +102,5 @@ Route::get('/performance', [TradingAnalysisController::class, 'performance']);
 Route::get('/telegram-chart-test/{symbol}', [TradingAnalysisController::class, 'telegramChartTest']);
 Route::get('/settings', [TradingAnalysisController::class, 'settings']);
 Route::post('/settings', [TradingAnalysisController::class, 'updateSettings']);
+
+
