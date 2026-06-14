@@ -49,7 +49,7 @@ class RuleAnalysisService
         $sl = 'N/A';
         $tp1 = 'N/A';
         $tp2 = 'N/A';
-
+        $rrText = 'N/A';;
         $score = 0;
         $reason = [];
 

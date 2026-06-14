@@ -128,10 +128,14 @@ class TradeSignalService
     {
         $upper = mb_strtoupper($analysis);
 
-        if (str_contains($upper, 'SELL')) return 'SELL';
-        if (str_contains($upper, 'BUY')) return 'BUY';
-        if (str_contains($analysis, 'সেল')) return 'SELL';
-        if (str_contains($analysis, 'বাই')) return 'BUY';
+        if (str_contains($upper, 'SELL'))
+            return 'SELL';
+        if (str_contains($upper, 'BUY'))
+            return 'BUY';
+        if (str_contains($analysis, 'সেল'))
+            return 'SELL';
+        if (str_contains($analysis, 'বাই'))
+            return 'BUY';
 
         return 'NO_TRADE';
     }
@@ -140,7 +144,8 @@ class TradeSignalService
     {
         $upper = mb_strtoupper($analysis);
 
-        if (str_contains($upper, 'A+')) return 'A+';
+        if (str_contains($upper, 'A+'))
+            return 'A+';
 
         if (str_contains($upper, 'TRADE GRADE: A') || str_contains($upper, 'ট্রেড গ্রেড: A')) {
             return 'A';
@@ -153,8 +158,10 @@ class TradeSignalService
     {
         $upper = mb_strtoupper($analysis);
 
-        if (str_contains($upper, 'বুলিশ') || str_contains($upper, 'BULLISH')) return 'Bullish';
-        if (str_contains($upper, 'বিয়ারিশ') || str_contains($upper, 'BEARISH')) return 'Bearish';
+        if (str_contains($upper, 'বুলিশ') || str_contains($upper, 'BULLISH'))
+            return 'Bullish';
+        if (str_contains($upper, 'বিয়ারিশ') || str_contains($upper, 'BEARISH'))
+            return 'Bearish';
 
         return null;
     }
@@ -185,5 +192,28 @@ class TradeSignalService
         file_put_contents($file, json_encode($keys, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
 
         return false;
+    }
+    public function extractSignalSummary(string $analysis): array
+    {
+        return [
+            'entry' => $this->extractTextAfterLabel($analysis, 'Entry'),
+            'sl' => $this->extractTextAfterLabel($analysis, 'SL'),
+            'tp1' => $this->extractTextAfterLabel($analysis, 'TP1'),
+            'tp2' => $this->extractTextAfterLabel($analysis, 'TP2'),
+            'grade' => $this->extractTextAfterLabel($analysis, 'Trade Grade'),
+            'plan' => $this->extractTextAfterLabel($analysis, 'Entry Plan'),
+            'rr' => $this->extractTextAfterLabel($analysis, 'R:R'),
+        ];
+    }
+
+    private function extractTextAfterLabel(string $text, string $label): ?string
+    {
+        $pattern = '/' . preg_quote($label, '/') . '\s*:\s*(.+)/i';
+
+        if (preg_match($pattern, $text, $matches)) {
+            return trim($matches[1]);
+        }
+
+        return null;
     }
 }

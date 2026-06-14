@@ -3,17 +3,15 @@
 namespace App\Http\Controllers;
 
 use Illuminate\Http\Request;
-use Illuminate\Support\Facades\Http;
 use App\Models\TradeSignal;
 use App\Models\SymbolSetting;
-use App\Models\SignalPattern;
-use App\Models\AlertTimeframe;
 use App\Services\PatternAlertService;
 use App\Services\TelegramService;
 use App\Services\RuleAnalysisService;
 use App\Services\TradeSignalService;
 use App\Services\SettingsService;
 use App\Services\AnalysisStorageService;
+use App\Services\GeminiAnalysisService;
 
 class TradingAnalysisController extends Controller
 {
@@ -23,31 +21,7 @@ class TradingAnalysisController extends Controller
 
         $symbol = $data['symbol'] ?? null;
 
-        if ($symbol) {
-            $setting = SymbolSetting::firstOrCreate(
-                ['symbol' => $symbol],
-                [
-                    'signal_enabled' => true,
-                    'trade_enabled' => false,
-                ]
-            );
-
-            if (!$setting->signal_enabled) {
-                return response()->json([
-                    'success' => true,
-                    'source' => 'disabled',
-                    'analysis' => 'Signal disabled for ' . $symbol,
-                ]);
-            }
-        }
-
-        $candleKey = app(AnalysisStorageService::class)->getSignalCandleKey($data);
-
-        app(TradeSignalService::class)->updateRunningResults($data, function ($signal, $result, $closedPrice) {
-            app(TelegramService::class)->sendCloseAlert($signal, $result, $closedPrice);
-        });
-
-        if (!isset($data['symbol'])) {
+        if (!$symbol) {
             return response()->json([
                 'success' => false,
                 'message' => 'Symbol missing',
@@ -55,127 +29,102 @@ class TradingAnalysisController extends Controller
             ], 422);
         }
 
-        // Pattern alert engine: selected symbol + selected timeframe + enabled signal pattern
-        $patternAlerts = app(PatternAlertService::class)->process($data, function ($message) {
-            app(TelegramService::class)->sendShortMessage($message);
+        $setting = SymbolSetting::firstOrCreate(
+            ['symbol' => $symbol],
+            [
+                'signal_enabled' => true,
+                'trade_enabled' => false,
+            ]
+        );
+
+        if (!$setting->signal_enabled) {
+            return response()->json([
+                'success' => true,
+                'source' => 'disabled',
+                'analysis' => 'Signal disabled for ' . $symbol,
+            ]);
+        }
+
+        $storage = app(AnalysisStorageService::class);
+        $tradeSignals = app(TradeSignalService::class);
+        $telegram = app(TelegramService::class);
+
+        $candleKey = $storage->getSignalCandleKey($data);
+
+        $tradeSignals->updateRunningResults($data, function ($signal, $result, $closedPrice) use ($telegram) {
+            $telegram->sendCloseAlert($signal, $result, $closedPrice);
         });
 
-        // 1) Rule Engine first
+        $patternAlerts = app(PatternAlertService::class)->process($data, function ($message) use ($telegram) {
+            $telegram->sendShortMessage($message);
+        });
+
         $ruleAnalysis = app(RuleAnalysisService::class)->analyze($data);
 
-        // 2) If rule engine says no trade, do not spend Gemini quota
-        if (!$this->isGoodSetup($ruleAnalysis)) {
-            $record = app(AnalysisStorageService::class)->makeRecord($data, $ruleAnalysis);
+        if (!$tradeSignals->isGoodSetup($ruleAnalysis)) {
+            $record = $storage->makeRecord($data, $ruleAnalysis);
 
-            $this->saveLatestAnalysis($record);
-            $this->saveHistory($record);
+            $storage->saveLatest($record);
+            $storage->saveHistory($record);
 
             return response()->json([
                 'success' => true,
                 'source' => 'rule_engine',
                 'analysis' => $ruleAnalysis,
+                'pattern_alerts' => $patternAlerts,
             ]);
         }
 
-        // 3) Rule engine found possible setup, now ask Gemini for confirmation if quota available
-        $prompt = $this->buildPrompt($data, $ruleAnalysis);
-        $parts = $this->buildGeminiParts($prompt, $data['symbol'] ?? 'XAUUSD');
+        $geminiResult = app(GeminiAnalysisService::class)->analyze($data, $ruleAnalysis);
 
-        $geminiResponse = Http::withoutVerifying()
-            ->timeout(90)
-            ->withHeaders([
-                'Content-Type' => 'application/json',
-            ])
-            ->post(
-                'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=' . env('GEMINI_API_KEY'),
-                [
-                    'contents' => [
-                        [
-                            'parts' => $parts
-                        ]
-                    ]
-                ]
-            );
-
-        // 4) If Gemini fails/quota exceeded, fallback to Rule Engine
-        if (!$geminiResponse->successful()) {
+        if (!$geminiResult['success']) {
             $analysis = $ruleAnalysis . "\n\nNote: Gemini quota/error এর কারণে Rule Engine analysis ব্যবহার করা হয়েছে।";
-            $record = app(AnalysisStorageService::class)->makeRecord($data, $analysis);
-            $this->saveLatestAnalysis($record);
-            $this->saveHistory($record);
-            $shouldAlert = app(TradeSignalService::class)->saveIfGood($analysis, $data, $candleKey);
+
+            $record = $storage->makeRecord($data, $analysis);
+
+            $storage->saveLatest($record);
+            $storage->saveHistory($record);
+
+            $shouldAlert = $tradeSignals->saveIfGood($analysis, $data, $candleKey);
 
             if ($shouldAlert) {
-                $summary = $this->extractSignalSummary($analysis);
-                app(TelegramService::class)->sendSignal($record, $summary);
+                $summary = $tradeSignals->extractSignalSummary($analysis);
+                $telegram->sendSignal($record, $summary);
             }
 
             return response()->json([
                 'success' => true,
                 'source' => 'rule_engine_fallback',
                 'analysis' => $analysis,
-                'gemini_status' => $geminiResponse->status(),
+                'gemini_status' => $geminiResult['status'],
+                'pattern_alerts' => $patternAlerts,
             ]);
         }
 
-        $analysis = $geminiResponse->json('candidates.0.content.parts.0.text');
+        $analysis = $geminiResult['analysis'];
 
         if (!$analysis) {
             $analysis = $ruleAnalysis . "\n\nNote: Gemini থেকে কোনো valid analysis পাওয়া যায়নি, তাই Rule Engine analysis ব্যবহার করা হয়েছে।";
         }
 
-        $record = app(AnalysisStorageService::class)->makeRecord($data, $analysis);
+        $record = $storage->makeRecord($data, $analysis);
 
-        app(AnalysisStorageService::class)->saveLatest($record);
-        app(AnalysisStorageService::class)->saveHistory($record);
-        app(TradeSignalService::class)->saveIfGood($analysis, $data, $candleKey);
+        $storage->saveLatest($record);
+        $storage->saveHistory($record);
 
-        if (app(TradeSignalService::class)->isGoodSetup($analysis)) {
-            $summary = $this->extractSignalSummary($analysis);
-            $this->sendTelegramSignal($record, $summary);
+        $shouldAlert = $tradeSignals->saveIfGood($analysis, $data, $candleKey);
+
+        if ($shouldAlert && $tradeSignals->isGoodSetup($analysis)) {
+            $summary = $tradeSignals->extractSignalSummary($analysis);
+            $telegram->sendSignal($record, $summary);
         }
 
         return response()->json([
             'success' => true,
             'source' => 'gemini_confirmed',
             'analysis' => $analysis,
+            'pattern_alerts' => $patternAlerts,
         ]);
-    }
-
-
-
-
-
-    private function buildGeminiParts(string $prompt, ?string $symbol = null): array
-    {
-        $parts = [
-            ['text' => $prompt]
-        ];
-
-        $symbol = $symbol ? strtoupper($symbol) : 'XAUUSD';
-
-        $chartFiles = [
-            'H4' => public_path("charts/{$symbol}_h4.png"),
-            'H1' => public_path("charts/{$symbol}_h1.png"),
-            'M15' => public_path("charts/{$symbol}_m15.png"),
-        ];
-
-        foreach ($chartFiles as $tf => $path) {
-            if (file_exists($path)) {
-                $parts[] = [
-                    'text' => $tf . ' chart image নিচে দেওয়া হলো।'
-                ];
-
-                $parts[] = [
-                    'inline_data' => [
-                        'mime_type' => 'image/png',
-                        'data' => base64_encode(file_get_contents($path)),
-                    ]
-                ];
-            }
-        }
-
-        return $parts;
     }
 
     public function testAnalyze()
@@ -193,6 +142,11 @@ class TradingAnalysisController extends Controller
                     'atr14' => 25,
                     'swing_high_30' => 4600,
                     'swing_low_30' => 4200,
+                    'candles' => [
+                        ['time' => '2026-06-15 01:00', 'open' => 4300, 'high' => 4310, 'low' => 4290, 'close' => 4295],
+                        ['time' => '2026-06-15 02:00', 'open' => 4296, 'high' => 4300, 'low' => 4280, 'close' => 4285],
+                        ['time' => '2026-06-15 03:00', 'open' => 4284, 'high' => 4320, 'low' => 4280, 'close' => 4315],
+                    ],
                 ],
                 'H4' => [
                     'trend' => 'bearish',
@@ -202,6 +156,11 @@ class TradingAnalysisController extends Controller
                     'atr14' => 22,
                     'swing_high_30' => 4450,
                     'swing_low_30' => 4210,
+                    'candles' => [
+                        ['time' => '2026-06-15 01:00', 'open' => 4300, 'high' => 4310, 'low' => 4290, 'close' => 4295],
+                        ['time' => '2026-06-15 02:00', 'open' => 4296, 'high' => 4300, 'low' => 4280, 'close' => 4285],
+                        ['time' => '2026-06-15 03:00', 'open' => 4284, 'high' => 4320, 'low' => 4280, 'close' => 4315],
+                    ],
                 ],
                 'H1' => [
                     'trend' => 'bearish',
@@ -211,6 +170,11 @@ class TradingAnalysisController extends Controller
                     'atr14' => 18,
                     'swing_high_30' => 4350,
                     'swing_low_30' => 4240,
+                    'candles' => [
+                        ['time' => '2026-06-15 01:00', 'open' => 4300, 'high' => 4310, 'low' => 4290, 'close' => 4295],
+                        ['time' => '2026-06-15 02:00', 'open' => 4296, 'high' => 4300, 'low' => 4280, 'close' => 4285],
+                        ['time' => '2026-06-15 03:00', 'open' => 4284, 'high' => 4320, 'low' => 4280, 'close' => 4315],
+                    ],
                 ],
                 'M15' => [
                     'trend' => 'bearish',
@@ -220,6 +184,11 @@ class TradingAnalysisController extends Controller
                     'atr14' => 8,
                     'swing_high_30' => 4295,
                     'swing_low_30' => 4255,
+                    'candles' => [
+                        ['time' => '2026-06-15 01:00', 'open' => 4300, 'high' => 4310, 'low' => 4290, 'close' => 4295],
+                        ['time' => '2026-06-15 02:00', 'open' => 4296, 'high' => 4300, 'low' => 4280, 'close' => 4285],
+                        ['time' => '2026-06-15 03:00', 'open' => 4284, 'high' => 4320, 'low' => 4280, 'close' => 4315],
+                    ],
                 ],
             ],
         ]);
@@ -241,6 +210,7 @@ class TradingAnalysisController extends Controller
         ];
 
         $cards = [];
+        $tradeSignals = app(TradeSignalService::class);
 
         foreach ($symbols as $symbol) {
             $latestFile = storage_path("app/latest_analysis_{$symbol}.json");
@@ -289,10 +259,10 @@ class TradingAnalysisController extends Controller
                 'latest' => $latest,
                 'signal' => $signal,
                 'is_good' => $latest && isset($latest['analysis'])
-                    ? $this->isGoodSetup($latest['analysis'])
+                    ? $tradeSignals->isGoodSetup($latest['analysis'])
                     : false,
                 'summary' => $latest && isset($latest['analysis'])
-                    ? $this->extractSignalSummary($latest['analysis'])
+                    ? $tradeSignals->extractSignalSummary($latest['analysis'])
                     : [],
                 'win_rate' => $winRate,
                 'running_pips' => $runningPips,
@@ -313,16 +283,13 @@ class TradingAnalysisController extends Controller
 
         return view('history', compact('history'));
     }
+
     public function stats()
     {
         $total = TradeSignal::count();
-
         $running = TradeSignal::where('result', 'RUNNING')->count();
-
         $wins = TradeSignal::where('result', 'WIN')->count();
-
         $bigWins = TradeSignal::where('result', 'BIG_WIN')->count();
-
         $losses = TradeSignal::where('result', 'LOSS')->count();
 
         $closedTrades = $wins + $bigWins + $losses;
@@ -338,7 +305,6 @@ class TradingAnalysisController extends Controller
         $performance = [];
 
         foreach ($symbolStats as $symbol) {
-
             $w = TradeSignal::where('symbol', $symbol)
                 ->whereIn('result', ['WIN', 'BIG_WIN'])
                 ->count();
@@ -374,6 +340,7 @@ class TradingAnalysisController extends Controller
             'performance' => $performance,
         ]);
     }
+
     public function signals()
     {
         $signals = TradeSignal::latest()->take(50)->get();
@@ -393,7 +360,7 @@ class TradingAnalysisController extends Controller
         if (!$request->hasFile('chart')) {
             return response()->json([
                 'success' => false,
-                'message' => 'No chart uploaded'
+                'message' => 'No chart uploaded',
             ], 422);
         }
 
@@ -402,7 +369,7 @@ class TradingAnalysisController extends Controller
 
         $timeframe = strtolower($request->input('timeframe', 'm15'));
 
-        if (!in_array($timeframe, ['h4', 'h1', 'm15', 'm15_signal'])) {
+        if (!in_array($timeframe, ['d1', 'h4', 'h1', 'm15', 'm15_signal'])) {
             $timeframe = 'm15';
         }
 
@@ -436,11 +403,12 @@ class TradingAnalysisController extends Controller
             'created_at' => now()->format('Y-m-d H:i:s'),
         ];
 
-        $this->saveLatestAnalysis($record);
-        $this->saveHistory($record);
+        app(AnalysisStorageService::class)->saveLatest($record);
+        app(AnalysisStorageService::class)->saveHistory($record);
 
         return response()->json(['success' => true]);
     }
+
     public function latestSignal()
     {
         $signal = TradeSignal::whereIn('grade', ['A', 'A+'])
@@ -489,123 +457,9 @@ class TradingAnalysisController extends Controller
         ]);
     }
 
-    private function buildPrompt(array $data, string $ruleAnalysis): string
-    {
-        return "
-আপনি একজন অভিজ্ঞ Pro Trader এবং Multi-Timeframe Trading Analyst.
-
-Rule Engine already found a possible setup.
-আপনি শুধু confirm করবেন setup A/A+ কিনা।
-যদি weak হয়, অবশ্যই লিখবেন: কোন ট্রেড নয়।
-
-Rule Engine Analysis:
-{$ruleAnalysis}
-
-ভাষা নির্দেশনা:
-- পুরো analysis অবশ্যই বাংলায় লিখবেন।
-- English sentence ব্যবহার করবেন না।
-- তবে trading terms যেমন D1, H4, H1, M15, EMA, RSI, ATR, FVG, Order Block, BOS, CHOCH, Entry, SL, TP ইংরেজিতে রাখা যাবে।
-- জোর করে buy/sell setup দিবেন না।
-- যদি chart image পাওয়া যায়, তাহলে chart image এবং MT5 JSON data দুইটা মিলিয়ে analysis করবেন।
-- H4/H1/M15 chart image দেওয়া থাকলে image দেখে Structure, Liquidity, OB, FVG, BOS/CHOCH verify করবেন।
-- JSON data এবং chart image conflict করলে chart image কে priority দিবেন।
-
-Rules:
-- শুধু A বা A+ setup হলে Entry, SL, TP দিবেন।
-- setup A/A+ না হলে Entry দিবেন না।
-- market unclear হলে কোন ট্রেড নয় বলবেন।
-- answer সংক্ষিপ্ত, practical এবং trader-style হবে।
-
-Output format ঠিক এইভাবে রাখবেন:
-
-Symbol:
-Entry Plan:
-
-Entry:
-SL:
-TP1:
-TP2:
-
-HTF Bias:
-Structure:
-Liquidity:
-Key Levels:
-Setup Zone:
-Trade Grade:
-Reason:
-
-MT5 Data:
-" . json_encode($data, JSON_UNESCAPED_UNICODE);
-    }
-
-
-
-
-
-    private function isGoodSetup(string $analysis): bool
-    {
-        $text = mb_strtoupper($analysis);
-
-        if (str_contains($text, 'কোন ট্রেড নয়')) {
-            return false;
-        }
-
-        if (str_contains($text, 'NO TRADE')) {
-            return false;
-        }
-
-        return str_contains($text, 'A+') ||
-            str_contains($text, 'TRADE GRADE: A') ||
-            str_contains($text, 'ট্রেড গ্রেড: A') ||
-            str_contains($text, 'TRADE GRADE: A+');
-    }
-
-    private function extractSignalSummary(string $analysis): array
-    {
-        return [
-            'entry' => $this->extractTextAfterLabel($analysis, 'Entry'),
-            'sl' => $this->extractTextAfterLabel($analysis, 'SL'),
-            'tp1' => $this->extractTextAfterLabel($analysis, 'TP1'),
-            'tp2' => $this->extractTextAfterLabel($analysis, 'TP2'),
-            'grade' => $this->extractTextAfterLabel($analysis, 'Trade Grade'),
-            'plan' => $this->extractTextAfterLabel($analysis, 'Entry Plan'),
-            'rr' => $this->extractTextAfterLabel($analysis, 'R:R'),
-        ];
-    }
-
-    private function extractTextAfterLabel(string $text, string $label): ?string
-    {
-        $pattern = '/' . preg_quote($label, '/') . '\s*:\s*(.+)/i';
-
-        if (preg_match($pattern, $text, $matches)) {
-            return trim($matches[1]);
-        }
-
-        return null;
-    }
-
-    private function isDuplicateSignal(string $analysis): bool
-    {
-        $hashFile = storage_path('app/last_signal_hash.txt');
-        $newHash = md5($analysis);
-
-        if (file_exists($hashFile)) {
-            $oldHash = trim(file_get_contents($hashFile));
-
-            if ($oldHash === $newHash) {
-                return true;
-            }
-        }
-
-        file_put_contents($hashFile, $newHash);
-
-        return false;
-    }
-
     public function symbolDashboard($symbol)
     {
         $symbol = urldecode($symbol);
-
         $latestFile = storage_path("app/latest_analysis_{$symbol}.json");
 
         $analysis = null;
@@ -615,7 +469,8 @@ MT5 Data:
             $analysis = json_decode(file_get_contents($latestFile), true);
 
             if ($analysis && isset($analysis['analysis'])) {
-                $summary = $this->extractSignalSummary($analysis['analysis']);
+                $summary = app(TradeSignalService::class)
+                    ->extractSignalSummary($analysis['analysis']);
             }
         }
 
@@ -643,7 +498,7 @@ MT5 Data:
             'grade' => 'A',
         ];
 
-        $this->sendTelegramSignal($record, $summary);
+        app(TelegramService::class)->sendSignal($record, $summary);
 
         return response()->json([
             'success' => true,
@@ -667,5 +522,4 @@ MT5 Data:
 
         return redirect('/settings')->with('success', $result['message']);
     }
-
 }
